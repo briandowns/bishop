@@ -1,0 +1,14 @@
+[
+  {
+    "command": "echo 'Hello once'",
+    "run_at": 1721764805,
+    "interval": 0,
+    "priority": 2
+  },
+  {
+    "command": "echo 'Every 15s'",
+    "run_at": 1721764800,
+    "interval": 15,
+    "priority": 1
+  }
+]
