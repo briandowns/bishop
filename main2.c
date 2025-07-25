@@ -1,290 +1,224 @@
-#define _GNU_SOURCE
+// Required libraries:
+// sudo apt install libevent-dev libjansson-dev libsqlite3-dev
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/wait.h>
-#include <sys/inotify.h>
-#include <sys/stat.h>
-#include <pthread.h>
-#include <sqlite3.h>
+#include <event2/event.h>
 #include <jansson.h>
+#include <sqlite3.h>
 
-#define MAX_TASKS 4096
-#define TASK_FILE "tasks.json"
-#define DB_FILE "task.db"
-#define LOG_DIR "./logs/"
-#define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + 16))
+#define DB_FILE "tasks.db"
+#define MAX_CMD 512
+#define MAX_BACKOFF 3600 // Max backoff 1 hour
 
-typedef struct {
+struct Task {
     int id;
     time_t run_at;
-    int priority;
+    int interval;
     int retries;
-    int interval; // NEW: repeating interval in seconds
-    char *command;
-} Task;
+    int max_retries;
+    int backoff;
+    int priority;
+    int enabled;
+    char command[MAX_CMD];
+    struct event *ev;
+};
 
-typedef struct {
-    Task *tasks[MAX_TASKS];
-    int size;
-    pthread_mutex_t lock;
-} TaskQueue;
-
-TaskQueue queue = {.size = 0, .lock = PTHREAD_MUTEX_INITIALIZER};
 sqlite3 *db;
+struct event_base *base;
 
-int task_cmp(Task *a, Task *b) {
-    if (a->run_at != b->run_at)
-        return a->run_at - b->run_at;
-    return b->priority - a->priority;
-}
-
-void push_task(Task *task) {
-    pthread_mutex_lock(&queue.lock);
-    int i = queue.size++;
-    while (i > 0) {
-        int parent = (i - 1) / 2;
-        if (task_cmp(task, queue.tasks[parent]) >= 0) break;
-        queue.tasks[i] = queue.tasks[parent];
-        i = parent;
-    }
-    queue.tasks[i] = task;
-    pthread_mutex_unlock(&queue.lock);
-}
-
-Task *pop_task() {
-    pthread_mutex_lock(&queue.lock);
-    if (queue.size == 0) {
-        pthread_mutex_unlock(&queue.lock);
-        return NULL;
-    }
-    Task *top = queue.tasks[0];
-    Task *last = queue.tasks[--queue.size];
-    int i = 0;
-    while (i * 2 + 1 < queue.size) {
-        int left = i * 2 + 1, right = i * 2 + 2;
-        int smallest = left;
-        if (right < queue.size && task_cmp(queue.tasks[right], queue.tasks[left]) < 0)
-            smallest = right;
-        if (task_cmp(last, queue.tasks[smallest]) <= 0) break;
-        queue.tasks[i] = queue.tasks[smallest];
-        i = smallest;
-    }
-    queue.tasks[i] = last;
-    pthread_mutex_unlock(&queue.lock);
-
-    return top;
-}
-
-void log_task_output(Task *task, const char *output) {
-    char filename[256];
-    snprintf(filename, sizeof(filename), LOG_DIR "task_%d_%ld.log", task->id, time(NULL));
-
-    FILE *f = fopen(filename, "a");
-    if (f) {
-        fprintf(f, "Command: %s\nOutput:\n%s\n", task->command, output);
-        fclose(f);
+void
+log_task_output(int id, const char *output)
+{
+    char filename[64];
+    snprintf(filename, sizeof(filename), "task_%d.log", id);
+    FILE *fp = fopen(filename, "a");
+    if (fp) {
+        fprintf(fp, "%s\n", output);
+        fclose(fp);
     }
 }
 
-void db_init() {
-    sqlite3_open(DB_FILE, &db);
-    char *err = NULL;
-
-    sqlite3_exec(db,
-        "CREATE TABLE IF NOT EXISTS tasks ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "run_at INTEGER, priority INTEGER, retries INTEGER,"
-        "interval INTEGER, command TEXT"
-        ");", NULL, NULL, &err);
-}
-
-void db_insert_task(Task *task) {
-    printf("XXX - inserting task...\n");
-    char *err = NULL;
+void
+save_task_state(struct Task *task)
+{
     sqlite3_stmt *stmt;
-    const char *sql = "INSERT INTO tasks (run_at, priority, retries, interval, command) VALUES (?, ?, ?, ?, ?)";
-
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) == SQLITE_OK) {
-        printf("XXX - inserting into db - %s\n", task->command);
-        sqlite3_bind_int64(stmt, 1, task->run_at);
-        sqlite3_bind_int(stmt, 2, task->priority);
-        sqlite3_bind_int(stmt, 3, task->retries);
-        sqlite3_bind_int(stmt, 4, task->interval);
-        sqlite3_bind_text(stmt, 5, task->command, -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        task->id = (int)sqlite3_last_insert_rowid(db);
-        sqlite3_finalize(stmt);
-    }
+    sqlite3_prepare_v2(db, "UPDATE tasks SET run_at=?, retries=?, backoff=?, enabled=? WHERE id=?", -1, &stmt, NULL);
+    sqlite3_bind_int64(stmt, 1, task->run_at);
+    sqlite3_bind_int(stmt, 2, task->retries);
+    sqlite3_bind_int(stmt, 3, task->backoff);
+    sqlite3_bind_int(stmt, 4, task->enabled);
+    sqlite3_bind_int(stmt, 5, task->id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
 }
 
-void db_load_tasks() {
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT id, run_at, priority, retries, interval, command FROM tasks";
+void
+run_task(evutil_socket_t fd, short what, void *arg)
+{
+    struct Task *task = (struct Task *)arg;
+    if (!task->enabled) return;
 
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) == SQLITE_OK) {
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            Task *t = malloc(sizeof(Task));
-            t->id = sqlite3_column_int(stmt, 0);
-            t->run_at = sqlite3_column_int64(stmt, 1);
-            t->priority = sqlite3_column_int(stmt, 2);
-            t->retries = sqlite3_column_int(stmt, 3);
-            t->interval = sqlite3_column_int(stmt, 4);
-            t->command = strdup((const char *)sqlite3_column_text(stmt, 5));
-            printf("XXX - pushing to queue - %s\n", t->command);
-            push_task(t);
+    printf("[*] Running task %d: %s\n", task->id, task->command);
+    int pipefd[2];
+    pipe(pipefd);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        execl("/bin/sh", "sh", "-c", task->command, NULL);
+        exit(127);
+    } else {
+        close(pipefd[1]);
+        char buffer[1024];
+        ssize_t count;
+        FILE *fp = fdopen(pipefd[0], "r");
+        while (fgets(buffer, sizeof(buffer), fp)) {
+            log_task_output(task->id, buffer);
         }
-        sqlite3_finalize(stmt);
-    }
-}
-
-void db_delete_task(int id) {
-    char sql[128];
-    snprintf(sql, sizeof(sql), "DELETE FROM tasks WHERE id = %d;", id);
-    sqlite3_exec(db, sql, NULL, NULL, NULL);
-}
-
-void *executor_thread(void *arg) {
-    printf("XXX - running execution...\n");
-    while (1) {
-        Task *task = pop_task();
-        if (!task) {
-            printf("XXX - no task\n");
-            sleep(1);
-            continue;
-        }
-
-        if (task->interval < 1) {
-            time_t now = time(NULL);
-            if (task->run_at > now) {
-                push_task(task);
-                sleep(1);
-                continue;
-            }
-
-            continue;
-        }
-
-        printf("XXX - proceeding with execution...\n");
-
-        int pipefd[2];
-        pipe(pipefd);
-        pid_t pid = fork();
-        if (pid == 0) {
-            close(pipefd[0]);
-            dup2(pipefd[1], STDOUT_FILENO);
-            dup2(pipefd[1], STDERR_FILENO);
-            execl("/bin/sh", "sh", "-c", task->command, NULL);
-            exit(127);
-        } else {
-            close(pipefd[1]);
-            char buffer[4096];
-            ssize_t count = read(pipefd[0], buffer, sizeof(buffer) - 1);
-            buffer[count > 0 ? count : 0] = '\0';
-            close(pipefd[0]);
-            int status;
-            waitpid(pid, &status, 0);
-
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                log_task_output(task, buffer);
-
-                if (task->interval > 0) {
-                    task->run_at = time(NULL) + task->interval;
-                    push_task(task);
-                    // Keep in DB
-                } else {
-                    db_delete_task(task->id);
-                    free(task->command);
-                    free(task);
-                }
+        fclose(fp);
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            task->retries = 0;
+            task->backoff = 0;
+            if (task->interval > 0) {
+                task->run_at = time(NULL) + task->interval;
             } else {
-                if (task->retries > 0) {
-                    task->retries--;
-                    task->run_at = time(NULL) + 5;
-                    push_task(task);
-                } else {
-                    log_task_output(task, buffer);
-
-                    if (task->interval > 0) {
-                        task->run_at = time(NULL) + task->interval;
-                        task->retries = 3; // reset retries for repeats
-                        push_task(task);
-                    } else {
-                        db_delete_task(task->id);
-                        free(task->command);
-                        free(task);
-                    }
-                }
+                task->enabled = 0;
+            }
+        } else {
+            task->retries++;
+            if (task->retries > task->max_retries) {
+                printf("[!] Task %d failed permanently\n", task->id);
+                task->enabled = 0;
+            } else {
+                task->backoff = (task->backoff == 0) ? 5 : task->backoff * 2;
+                if (task->backoff > MAX_BACKOFF) task->backoff = MAX_BACKOFF;
+                task->run_at = time(NULL) + task->backoff;
+                printf("[!] Task %d failed. Retrying in %d sec\n", task->id, task->backoff);
             }
         }
+        save_task_state(task);
+        struct timeval tv = { task->run_at - time(NULL), 0 };
+        evtimer_add(task->ev, &tv);
     }
-    return NULL;
 }
 
-void load_json_tasks(const char *filename) {
-    json_error_t err;
-    json_t *root = json_load_file(filename, 0, &err);
-    if (!root || !json_is_array(root)) return;
+void
+schedule_task(struct Task *task)
+{
+    time_t now = time(NULL);
+    time_t delay = (task->run_at > now) ? (task->run_at - now) : 0;
+    struct timeval tv = { delay, 0 };
+    task->ev = evtimer_new(base, run_task, task);
+    evtimer_add(task->ev, &tv);
+    printf("[+] Scheduled task %d in %ld sec\n", task->id, delay);
+}
 
-    size_t i;
-    json_t *item;
-    json_array_foreach(root, i, item) {
-        Task *t = malloc(sizeof(Task));
-        t->id = -1;
-        const char *cmd = NULL;
-        json_unpack(item, "{s:i, s:i, s:i, s:i, s:s}",
-            "run_at", &t->run_at,
-            "priority", &t->priority,
-            "retries", &t->retries,
-            "interval", &t->interval,
-            "command", &cmd);
-
-        t->command = strdup(cmd);
-        db_insert_task(t);
-        push_task(t);
+void
+load_tasks_from_db()
+{
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT id, run_at, interval, retries, max_retries, backoff, priority, enabled, command FROM tasks WHERE enabled=1";
+    sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        struct Task *task = malloc(sizeof(struct Task));
+        task->id = sqlite3_column_int(stmt, 0);
+        task->run_at = sqlite3_column_int64(stmt, 1);
+        task->interval = sqlite3_column_int(stmt, 2);
+        task->retries = sqlite3_column_int(stmt, 3);
+        task->max_retries = sqlite3_column_int(stmt, 4);
+        task->backoff = sqlite3_column_int(stmt, 5);
+        task->priority = sqlite3_column_int(stmt, 6);
+        task->enabled = sqlite3_column_int(stmt, 7);
+        strncpy(task->command, (const char *)sqlite3_column_text(stmt, 8), MAX_CMD);
+        schedule_task(task);
     }
+    sqlite3_finalize(stmt);
+}
 
+void
+create_db_if_needed()
+{
+    const char *sql = "CREATE TABLE IF NOT EXISTS tasks ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "run_at INTEGER,"
+        "interval INTEGER,"
+        "retries INTEGER DEFAULT 0,"
+        "max_retries INTEGER DEFAULT 3,"
+        "backoff INTEGER DEFAULT 0,"
+        "priority INTEGER DEFAULT 0,"
+        "enabled INTEGER DEFAULT 1,"
+        "command TEXT)";
+    char *err = NULL;
+    sqlite3_exec(db, sql, 0, 0, &err);
+    if (err) {
+        fprintf(stderr, "DB error: %s\n", err);
+        sqlite3_free(err);
+    }
+}
+
+void
+import_tasks_from_json(const char *filename)
+{
+    json_error_t error;
+    json_t *root = json_load_file(filename, 0, &error);
+    if (!root) {
+        fprintf(stderr, "JSON error: %s\n", error.text);
+        return;
+    }
+    size_t i;
+    json_t *task;
+    sqlite3_stmt *stmt;
+    json_array_foreach(root, i, task) {
+        const char *cmd = json_string_value(json_object_get(task, "command"));
+        time_t run_at = json_integer_value(json_object_get(task, "run_at"));
+        int interval = json_integer_value(json_object_get(task, "interval"));
+        int retries = json_integer_value(json_object_get(task, "retries"));
+        int max_retries = json_integer_value(json_object_get(task, "max_retries"));
+        int backoff = json_integer_value(json_object_get(task, "backoff"));
+        int priority = json_integer_value(json_object_get(task, "priority"));
+        int enabled = json_boolean_value(json_object_get(task, "enabled"));
+
+        sqlite3_prepare_v2(db, "INSERT INTO tasks (run_at, interval, retries, max_retries, backoff, priority, enabled, command) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, NULL);
+        sqlite3_bind_int64(stmt, 1, run_at);
+        sqlite3_bind_int(stmt, 2, interval);
+        sqlite3_bind_int(stmt, 3, retries);
+        sqlite3_bind_int(stmt, 4, max_retries);
+        sqlite3_bind_int(stmt, 5, backoff);
+        sqlite3_bind_int(stmt, 6, priority);
+        sqlite3_bind_int(stmt, 7, enabled);
+        sqlite3_bind_text(stmt, 8, cmd, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
     json_decref(root);
 }
 
-void *watcher_thread(void *arg) {
-    int fd = inotify_init();
-    if (fd < 0) return NULL;
+int
+main(int argc, char *argv[])
+{
+    if (sqlite3_open(DB_FILE, &db)) {
+        fprintf(stderr, "Can't open DB\n");
+        return 1;
+    }
+    create_db_if_needed();
 
-    int wd = inotify_add_watch(fd, TASK_FILE, IN_MODIFY);
-    char buffer[EVENT_BUF_LEN];
-
-    while (1) {
-        int length = read(fd, buffer, EVENT_BUF_LEN);
-        if (length < 0) continue;
-        sleep(1); // debounce
-        load_json_tasks(TASK_FILE);
+    if (argc == 2) {
+        import_tasks_from_json(argv[1]);
     }
 
-    inotify_rm_watch(fd, wd);
-    close(fd);
-    return NULL;
-}
-
-int main() {
-    printf("XXX - creating dir...\n");
-    mkdir(LOG_DIR, 0755);
-
-    printf("XXX - init db...\n");
-    db_init();
-
-    printf("XXX - loading db...\n");
-    db_load_tasks();
-
-    pthread_t exec_tid, watch_tid;
-    pthread_create(&exec_tid, NULL, executor_thread, NULL);
-    pthread_create(&watch_tid, NULL, watcher_thread, NULL);
-
-    pthread_join(exec_tid, NULL);
-    pthread_join(watch_tid, NULL);
+    base = event_base_new();
+    load_tasks_from_db();
+    event_base_dispatch(base);
+    event_base_free(base);
     sqlite3_close(db);
     return 0;
 }

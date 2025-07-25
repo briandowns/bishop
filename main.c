@@ -1,192 +1,179 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include <event2/event.h>
+#include <time.h>
+#include <jansson.h>
+#include <sqlite3.h>
 #include <sys/wait.h>
-#include <sys/inotify.h>
-#include <pthread.h>
 
-#define MAX_TASKS 1024
-#define MAX_LINE 2048
-#define TASK_FILE "tasks.txt"
-#define LOG_DIR "./logs/"
-#define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + 16))
+#define DB_FILE "tasks.db"
 
 typedef struct {
+    struct event *ev;
+    struct event_base *base;
     time_t run_at;
+    int interval;
     int priority;
-    int retries;
     char *command;
 } Task;
 
-typedef struct {
-    Task *tasks[MAX_TASKS];
-    int size;
-    pthread_mutex_t lock;
-} TaskQueue;
-
-TaskQueue queue = {.size = 0, .lock = PTHREAD_MUTEX_INITIALIZER};
-
-// Comparator for priority queue
-int task_cmp(Task *a, Task *b) {
-    if (a->run_at != b->run_at)
-        return a->run_at - b->run_at;
-    return b->priority - a->priority;
+// Comparator: Lower run_at first; if equal, higher priority first
+int
+task_cmp(const void *a, const void *b)
+{
+    Task *t1 = *(Task **)a, *t2 = *(Task **)b;
+    if (t1->run_at != t2->run_at) return (t1->run_at > t2->run_at) - (t1->run_at < t2->run_at);
+    return t2->priority - t1->priority;
 }
 
-void push_task(Task *task) {
-    pthread_mutex_lock(&queue.lock);
-    int i = queue.size++;
-    while (i > 0) {
-        int parent = (i - 1) / 2;
-        if (task_cmp(task, queue.tasks[parent]) >= 0) break;
-        queue.tasks[i] = queue.tasks[parent];
-        i = parent;
+sqlite3*
+init_db()
+{
+    sqlite3 *db;
+    if (sqlite3_open(DB_FILE, &db)) {
+        fprintf(stderr, "DB error: %s\n", sqlite3_errmsg(db));
+        exit(1);
     }
-    queue.tasks[i] = task;
-    pthread_mutex_unlock(&queue.lock);
+
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS tasks ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "command TEXT,"
+        "run_at INTEGER,"
+        "interval INTEGER,"
+        "priority INTEGER,"
+        "last_run INTEGER"
+        ");";
+
+    char *err = NULL;
+    if (sqlite3_exec(db, sql, 0, 0, &err) != SQLITE_OK) {
+        fprintf(stderr, "DB init error: %s\n", err);
+        sqlite3_free(err);
+        exit(1);
+    }
+
+    return db;
 }
 
-Task *pop_task() {
-    pthread_mutex_lock(&queue.lock);
-    if (queue.size == 0) {
-        pthread_mutex_unlock(&queue.lock);
-        return NULL;
-    }
-    Task *top = queue.tasks[0];
-    Task *last = queue.tasks[--queue.size];
-    int i = 0;
-    while (i * 2 + 1 < queue.size) {
-        int left = i * 2 + 1, right = i * 2 + 2;
-        int smallest = left;
-        if (right < queue.size && task_cmp(queue.tasks[right], queue.tasks[left]) < 0)
-            smallest = right;
-        if (task_cmp(last, queue.tasks[smallest]) <= 0) break;
-        queue.tasks[i] = queue.tasks[smallest];
-        i = smallest;
-    }
-    queue.tasks[i] = last;
-    pthread_mutex_unlock(&queue.lock);
-    return top;
+void
+save_task_to_db(sqlite3 *db, Task *task)
+{
+    const char *sql = "INSERT INTO tasks (command, run_at, interval, priority, last_run) VALUES (?, ?, ?, ?, ?)";
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, task->command, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, task->run_at);
+    sqlite3_bind_int(stmt, 3, task->interval);
+    sqlite3_bind_int(stmt, 4, task->priority);
+    sqlite3_bind_int(stmt, 5, 0);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
 }
 
-void log_task_output(Task *task, const char *output) {
-    char filename[256];
-    snprintf(filename, sizeof(filename), LOG_DIR "task_%ld.log", time(NULL));
-    FILE *f = fopen(filename, "a");
-    if (f) {
-        fprintf(f, "Command: %s\nOutput:\n%s\n", task->command, output);
-        fclose(f);
+void
+run_task(evutil_socket_t fd, short what, void *arg)
+{
+    Task *task = (Task *)arg;
+    printf("[*] Running: %s\n", task->command);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", task->command, NULL);
+        exit(127);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
     }
-}
 
-void *executor_thread(void *arg) {
-    while (1) {
-        Task *task = pop_task();
-        if (!task) {
-            sleep(1);
-            continue;
-        }
-
-        time_t now = time(NULL);
-        if (task->run_at > now) {
-            push_task(task);
-            sleep(1);
-            continue;
-        }
-
-        int pipefd[2];
-        pipe(pipefd);
-        pid_t pid = fork();
-        if (pid == 0) {
-            close(pipefd[0]);
-            dup2(pipefd[1], STDOUT_FILENO);
-            dup2(pipefd[1], STDERR_FILENO);
-            execl("/bin/sh", "sh", "-c", task->command, NULL);
-            exit(127);
-        } else {
-            close(pipefd[1]);
-            char buffer[4096];
-            ssize_t count = read(pipefd[0], buffer, sizeof(buffer) - 1);
-            buffer[count > 0 ? count : 0] = '\0';
-            close(pipefd[0]);
-            int status;
-            waitpid(pid, &status, 0);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                log_task_output(task, buffer);
-                free(task->command);
-                free(task);
-            } else {
-                if (task->retries > 0) {
-                    task->retries--;
-                    task->run_at = time(NULL) + 5; // retry after delay
-                    push_task(task);
-                } else {
-                    log_task_output(task, buffer);
-                    free(task->command);
-                    free(task);
-                }
-            }
-        }
-    }
-    return NULL;
-}
-
-Task *parse_line(char *line) {
-    Task *task = malloc(sizeof(Task));
-    task->command = malloc(MAX_LINE);
-    if (sscanf(line, "%ld %d %d %[^\n]", &task->run_at, &task->priority, &task->retries, task->command) != 4) {
+    if (task->interval > 0) {
+        task->run_at = time(NULL) + task->interval;
+        struct timeval tv = { task->interval, 0 };
+        evtimer_add(task->ev, &tv);
+    } else {
+        event_free(task->ev);
         free(task->command);
         free(task);
-        return NULL;
     }
+}
+
+Task*
+schedule_task(struct event_base *base, sqlite3 *db, time_t run_at, int interval, int priority, const char *cmd)
+{
+    Task *task = malloc(sizeof(Task));
+    task->base = base;
+    task->run_at = run_at;
+    task->interval = interval;
+    task->priority = priority;
+    task->command = strdup(cmd);
+    task->ev = evtimer_new(base, run_task, task);
+
+    time_t now = time(NULL);
+    time_t delay = (run_at > now) ? (run_at - now) : 0;
+    struct timeval tv = { delay, 0 };
+    evtimer_add(task->ev, &tv);
+
+    save_task_to_db(db, task);
+
+    printf("[+] Scheduled: %s at %ld (interval %d, priority %d)\n", cmd, run_at, interval, priority);
     return task;
 }
 
-void load_tasks_from_file(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) return;
-    char line[MAX_LINE];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || strlen(line) < 2) continue;
-        Task *task = parse_line(line);
-        if (task) push_task(task);
-    }
-    fclose(f);
-}
-
-void *watcher_thread(void *arg) {
-    int fd = inotify_init();
-    if (fd < 0) return NULL;
-
-    int wd = inotify_add_watch(fd, TASK_FILE, IN_MODIFY);
-    char buffer[EVENT_BUF_LEN];
-
-    while (1) {
-        int length = read(fd, buffer, EVENT_BUF_LEN);
-        if (length < 0) continue;
-        sleep(1); // debounce
-        load_tasks_from_file(TASK_FILE);
+void
+load_tasks_from_json(const char *filename, struct event_base *base, sqlite3 *db)
+{
+    json_error_t error;
+    json_t *root = json_load_file(filename, 0, &error);
+    if (!root || !json_is_array(root)) {
+        fprintf(stderr, "Failed to load JSON: %s\n", error.text);
+        exit(1);
     }
 
-    inotify_rm_watch(fd, wd);
-    close(fd);
-    return NULL;
+    size_t i;
+    size_t task_count = json_array_size(root);
+    Task **task_list = malloc(sizeof(Task *) * task_count);
+
+    for (i = 0; i < task_count; i++) {
+        json_t *item = json_array_get(root, i);
+        const char *cmd = json_string_value(json_object_get(item, "command"));
+        time_t run_at = (time_t)json_integer_value(json_object_get(item, "run_at"));
+        int interval = json_integer_value(json_object_get(item, "interval"));
+        int priority = json_integer_value(json_object_get(item, "priority"));
+
+        Task *task = malloc(sizeof(Task));
+        task->base = base;
+        task->run_at = run_at;
+        task->interval = interval;
+        task->priority = priority;
+        task->command = strdup(cmd);
+        task_list[i] = task;
+    }
+
+    qsort(task_list, task_count, sizeof(Task *), task_cmp);
+
+    for (i = 0; i < task_count; i++) {
+        schedule_task(base, db, task_list[i]->run_at, task_list[i]->interval, task_list[i]->priority, task_list[i]->command);
+        free(task_list[i]->command);
+        free(task_list[i]);
+    }
+
+    free(task_list);
+    json_decref(root);
 }
 
-int main() {
-    mkdir(LOG_DIR, 0755);
-    load_tasks_from_file(TASK_FILE);
+int
+main()
+{
+    struct event_base *base = event_base_new();
+    sqlite3 *db = init_db();
 
-    pthread_t exec_tid, watch_tid;
-    pthread_create(&exec_tid, NULL, executor_thread, NULL);
-    pthread_create(&watch_tid, NULL, watcher_thread, NULL);
+    load_tasks_from_json("tasks.json", base, db);
 
-    pthread_join(exec_tid, NULL);
-    pthread_join(watch_tid, NULL);
+    printf("[*] Starting scheduler loop...\n");
+    event_base_dispatch(base);
+
+    sqlite3_close(db);
+    event_base_free(base);
     return 0;
 }

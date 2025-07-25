@@ -1,0 +1,29 @@
+[
+  {
+    "name": "Backup Home",
+    "command": "tar -czf /tmp/home_backup.tar.gz /home/username",
+    "run_at": 1722030000,
+    "interval": 0,
+    "priority": 1,
+    "enabled": true,
+    "max_retries": 3
+  },
+  {
+    "name": "Check Disk Usage",
+    "command": "df -h > /tmp/disk_usage.txt",
+    "run_at": 1722026400,
+    "interval": 3600,
+    "priority": 2,
+    "enabled": true,
+    "max_retries": 5
+  },
+  {
+    "name": "Disabled Task Example",
+    "command": "echo 'This task is disabled.'",
+    "run_at": 1722022800,
+    "interval": 60,
+    "priority": 3,
+    "enabled": false,
+    "max_retries": 2
+  }
+]
