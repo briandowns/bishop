@@ -16,6 +16,11 @@
 #define MAX_CMD 512
 #define MAX_BACKOFF 3600 // Max backoff 1 hour
 
+#define MAX_FILENAME_LEN 255
+
+#define SAVE_TASK_STATE_QUERY "UPDATE tasks SET " \
+    "run_at=?, retries=?, backoff=?, enabled=? WHERE id=?"
+
 struct Task {
     int id;
     time_t run_at;
@@ -35,7 +40,7 @@ struct event_base *base;
 void
 log_task_output(int id, const char *output)
 {
-    char filename[64];
+    char filename[MAX_FILENAME_LEN];
     snprintf(filename, sizeof(filename), "task_%d.log", id);
     FILE *fp = fopen(filename, "a");
     if (fp) {
@@ -48,7 +53,7 @@ void
 save_task_state(struct Task *task)
 {
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(db, "UPDATE tasks SET run_at=?, retries=?, backoff=?, enabled=? WHERE id=?", -1, &stmt, NULL);
+    sqlite3_prepare_v2(db, SAVE_TASK_STATE_QUERY, -1, &stmt, NULL);
     sqlite3_bind_int64(stmt, 1, task->run_at);
     sqlite3_bind_int(stmt, 2, task->retries);
     sqlite3_bind_int(stmt, 3, task->backoff);

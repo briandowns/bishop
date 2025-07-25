@@ -1,0 +1,12 @@
+*.o
+*.so
+*.dynlib
+
+.vscode/
+
+bin/*
+tests/tests
+spin
+example
+bishop
+*.db

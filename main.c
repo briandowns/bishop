@@ -9,21 +9,35 @@
 #include <sys/wait.h>
 
 #define DB_FILE "tasks.db"
+#define MAX_CMD 512
+#define MAX_BACKOFF 3600 // Max backoff 1 hour
+
+#define MAX_FILENAME_LEN 255
+
+#define SAVE_TASK_STATE_QUERY "UPDATE tasks SET " \
+    "run_at=?, retries=?, backoff=?, enabled=? WHERE id=?"
 
 typedef struct {
+    int id;
     struct event *ev;
     struct event_base *base;
     time_t run_at;
     int interval;
+    int retries;
+    int max_retries;
+    int backoff;
     int priority;
+    int enabled;
     char *command;
-} Task;
+} task_t;
+
+sqlite3 *db;
 
 // Comparator: Lower run_at first; if equal, higher priority first
 int
 task_cmp(const void *a, const void *b)
 {
-    Task *t1 = *(Task **)a, *t2 = *(Task **)b;
+    task_t *t1 = *(task_t **)a, *t2 = *(task_t **)b;
     if (t1->run_at != t2->run_at) return (t1->run_at > t2->run_at) - (t1->run_at < t2->run_at);
     return t2->priority - t1->priority;
 }
@@ -31,21 +45,21 @@ task_cmp(const void *a, const void *b)
 sqlite3*
 init_db()
 {
-    sqlite3 *db;
     if (sqlite3_open(DB_FILE, &db)) {
         fprintf(stderr, "DB error: %s\n", sqlite3_errmsg(db));
         exit(1);
     }
 
-    const char *sql =
-        "CREATE TABLE IF NOT EXISTS tasks ("
+    const char *sql = "CREATE TABLE IF NOT EXISTS tasks ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "command TEXT,"
         "run_at INTEGER,"
         "interval INTEGER,"
-        "priority INTEGER,"
-        "last_run INTEGER"
-        ");";
+        "retries INTEGER DEFAULT 0,"
+        "max_retries INTEGER DEFAULT 3,"
+        "backoff INTEGER DEFAULT 0,"
+        "priority INTEGER DEFAULT 0,"
+        "enabled INTEGER DEFAULT 1,"
+        "command TEXT)";
 
     char *err = NULL;
     if (sqlite3_exec(db, sql, 0, 0, &err) != SQLITE_OK) {
@@ -58,7 +72,21 @@ init_db()
 }
 
 void
-save_task_to_db(sqlite3 *db, Task *task)
+save_task_state(task_t *task)
+{
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db, SAVE_TASK_STATE_QUERY, -1, &stmt, NULL);
+    sqlite3_bind_int64(stmt, 1, task->run_at);
+    sqlite3_bind_int(stmt, 2, task->retries);
+    sqlite3_bind_int(stmt, 3, task->backoff);
+    sqlite3_bind_int(stmt, 4, task->enabled);
+    sqlite3_bind_int(stmt, 5, task->id);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+void
+save_task_to_db(sqlite3 *db, task_t *task)
 {
     const char *sql = "INSERT INTO tasks (command, run_at, interval, priority, last_run) VALUES (?, ?, ?, ?, ?)";
     sqlite3_stmt *stmt;
@@ -75,7 +103,7 @@ save_task_to_db(sqlite3 *db, Task *task)
 void
 run_task(evutil_socket_t fd, short what, void *arg)
 {
-    Task *task = (Task *)arg;
+    task_t *task = (task_t *)arg;
     printf("[*] Running: %s\n", task->command);
 
     pid_t pid = fork();
@@ -98,10 +126,10 @@ run_task(evutil_socket_t fd, short what, void *arg)
     }
 }
 
-Task*
+task_t*
 schedule_task(struct event_base *base, sqlite3 *db, time_t run_at, int interval, int priority, const char *cmd)
 {
-    Task *task = malloc(sizeof(Task));
+    task_t *task = malloc(sizeof(task_t));
     task->base = base;
     task->run_at = run_at;
     task->interval = interval;
@@ -130,18 +158,17 @@ load_tasks_from_json(const char *filename, struct event_base *base, sqlite3 *db)
         exit(1);
     }
 
-    size_t i;
     size_t task_count = json_array_size(root);
-    Task **task_list = malloc(sizeof(Task *) * task_count);
+    task_t **task_list = malloc(sizeof(task_t *) * task_count);
 
-    for (i = 0; i < task_count; i++) {
+    for (size_t i = 0; i < task_count; i++) {
         json_t *item = json_array_get(root, i);
         const char *cmd = json_string_value(json_object_get(item, "command"));
         time_t run_at = (time_t)json_integer_value(json_object_get(item, "run_at"));
         int interval = json_integer_value(json_object_get(item, "interval"));
         int priority = json_integer_value(json_object_get(item, "priority"));
 
-        Task *task = malloc(sizeof(Task));
+        task_t *task = malloc(sizeof(task_t));
         task->base = base;
         task->run_at = run_at;
         task->interval = interval;
@@ -150,9 +177,9 @@ load_tasks_from_json(const char *filename, struct event_base *base, sqlite3 *db)
         task_list[i] = task;
     }
 
-    qsort(task_list, task_count, sizeof(Task *), task_cmp);
+    qsort(task_list, task_count, sizeof(task_t *), task_cmp);
 
-    for (i = 0; i < task_count; i++) {
+    for (size_t i = 0; i < task_count; i++) {
         schedule_task(base, db, task_list[i]->run_at, task_list[i]->interval, task_list[i]->priority, task_list[i]->command);
         free(task_list[i]->command);
         free(task_list[i]);
@@ -166,7 +193,7 @@ int
 main()
 {
     struct event_base *base = event_base_new();
-    sqlite3 *db = init_db();
+    db = init_db();
 
     load_tasks_from_json("tasks.json", base, db);
 
@@ -175,5 +202,6 @@ main()
 
     sqlite3_close(db);
     event_base_free(base);
+
     return 0;
 }
